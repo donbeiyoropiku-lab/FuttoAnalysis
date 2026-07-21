@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import numpy as np
 from pathlib import Path
 
 _HERE = Path(__file__).resolve()
