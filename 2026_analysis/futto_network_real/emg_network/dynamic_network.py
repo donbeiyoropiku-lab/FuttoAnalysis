@@ -507,29 +507,18 @@ class DynamicMuscleNetworkAnalyzer:
 
     def _global_efficiency_nx(self, G) -> float:
         """
-        Global Efficiency を NetworkX で計算する（正規化済み版）。
+        Global Efficiency を NetworkX で計算する（正規化済み, range [0,1]）。
 
-        【定義】
-          距離: d_ij = 1 / MI_ij  （MI が大きいほど近い）
-          E = (1 / N(N-1)) * Σ_{i≠j} (1 / d_ij)
-            = (1 / N(N-1)) * Σ_{i≠j} MI_ij_shortest
+        距離 d_ij = 1 / MI_ij を最短経路で求め、
+        MI_max で除算して正規化することで必ず [0, 1] に収まる。
 
-        【正規化】
-          完全グラフ（全エッジの MI が最大値 MI_max）の場合の E_max で割る:
-          E_norm = E / E_max  ∈ [0, 1]
-          E_max = MI_max（1ホップで全ノードに到達できる完全グラフの場合）
-
-        【1.0 超過の問題の原因と修正】
-          旧実装: 距離 d = 1/MI を Dijkstra で計算 → その逆数 1/d = MI を加算
-          → 短い経路（多ホップ）で合計 MI が 1 を超える場合があった
-          修正後: 最大 MI 重みで正規化することで必ず [0, 1] に収まる
+        E = (1/N(N-1)) * Σ_{i≠j} (1/d_ij) / MI_max
         """
         import networkx as nx
         N = G.number_of_nodes()
         if N <= 1:
             return 0.0
 
-        # エッジ属性 'distance' = 1 / (MI + ε) を追加
         G_dist = G.copy()
         all_weights = []
         for u, v, data in G_dist.edges(data=True):
@@ -539,24 +528,20 @@ class DynamicMuscleNetworkAnalyzer:
 
         if not all_weights:
             return 0.0
-
-        # 最大 MI 値（正規化の基準）
         mi_max = max(all_weights)
         if mi_max <= 0:
             return 0.0
 
-        total_inv_dist = 0.0
+        total_inv = 0.0
         for node in G_dist.nodes():
             lengths = nx.single_source_dijkstra_path_length(
                 G_dist, node, weight='distance'
             )
             for other, d in lengths.items():
                 if other != node and d > 0:
-                    # 1/d = 最短経路上の「MI的な近さ」
-                    # mi_max で割って正規化 → 最大でも 1.0
-                    total_inv_dist += (1.0 / d) / mi_max
+                    total_inv += (1.0 / d) / mi_max
 
-        return float(total_inv_dist / (N * (N - 1)))
+        return float(total_inv / (N * (N - 1)))
 
     def _louvain_modularity(self, G) -> float:
         """
@@ -964,57 +949,115 @@ def generate_dummy_emg(
 
 
 # =============================================================================
-# __main__: デモ実行
+# __main__: 実データ実行
 # =============================================================================
 
-if __name__ == "__main__":
-    import time
-    print("=" * 60)
-    print(" Dynamic Muscle Network Analyzer — デモ実行")
-    print("=" * 60)
+def _run_one(task_key, phase, subject, base_dir, result_dir, analyzer):
+    """1タスク × 1フェーズ の MI ネットワーク解析を実行する。"""
+    import time, pandas as pd
+    phase_speed = {1:'0.7', 2:'0.9', 3:'1.1', 4:'1.3', 5:'1.5'}
+    speed = phase_speed.get(phase, str(phase))
 
-    # ── ダミーデータ生成 ─────────────────────────────────────────
-    print("\n[1/4] ダミーEMGデータ生成 (16ch × 10000samples @ 2000Hz) ...")
-    emg_dummy = generate_dummy_emg(n_channels=16, n_samples=10000, fs=2000)
-    print(f"  shape: {emg_dummy.shape}  range: [{emg_dummy.min():.3f}, {emg_dummy.max():.3f}]")
-
-    # ── アナライザー初期化 ────────────────────────────────────────
-    print("\n[2/4] アナライザー初期化 ...")
-    analyzer = DynamicMuscleNetworkAnalyzer(
-        fs            = 2000,
-        window_ms     = 200,     # 200ms ウィンドウ（= 400サンプル）
-        step_ms       = 100,     # 100ms ステップ
-        n_neighbors   = 5,
-        n_jobs        = 1,       # デモはシリアル実行
-        sparsify      = 'percentile',
-        sparsify_param= 0.70,    # 上位30%のエッジを保持
+    csv_path = (
+        Path(result_dir) / "2026" / subject / task_key / speed
+        / f"{task_key}_Phase{phase}_{speed}ms_emg_normalized.csv"
     )
-    print(f"  window_size={analyzer.window_size}pts, step={analyzer.step_size}pts")
+    if not csv_path.exists():
+        print(f"  [Skip] CSV が見つかりません: {csv_path}")
+        return
 
-    # ── 解析実行 ──────────────────────────────────────────────────
-    print("\n[3/4] ネットワーク解析実行 ...")
-    t0     = time.time()
-    result = analyzer.run(emg_dummy, verbose=True)
-    elapsed= time.time() - t0
-    print(f"\n  完了: {elapsed:.1f}秒")
-    print(f"  ウィンドウ数: {result.n_windows}")
-    print(f"  E_mean={result.global_efficiency.mean():.4f}  "
-          f"E_std={result.global_efficiency.std():.4f}")
-    print(f"  Q_mean={result.modularity.mean():.4f}  "
-          f"Q_std={result.modularity.std():.4f}")
-    dc_mean = result.degree_centrality.mean(axis=0)
+    df       = pd.read_csv(csv_path)
+    ch_names = [c for c in df.columns if c != 'Time_s']
+    emg      = df[ch_names].values.T.astype(float)
+    print(f"  EMG: {emg.shape}  range=[{emg.min():.3f}, {emg.max():.3f}]")
+
+    t0      = time.time()
+    result  = analyzer.run(emg, verbose=True)
+    elapsed = time.time() - t0
+    print(f"  完了: {elapsed:.1f}秒  windows={result.n_windows}")
+
+    dc_mean  = result.degree_centrality.mean(axis=0)
     top3_idx = np.argsort(dc_mean)[::-1][:3]
-    print(f"  Top-3 ハブ筋: {[result.channel_names[i] for i in top3_idx]}")
+    print(f"  E_mean={result.global_efficiency.mean():.4f}  "
+          f"Q_mean={result.modularity.mean():.4f}")
+    print(f"  Top-3 hub muscles: {[result.channel_names[i] for i in top3_idx]}")
 
-    # ── 可視化 ────────────────────────────────────────────────────
-    print("\n[4/4] グラフ出力 ...")
-    out_dir = Path("./network_results/demo")
+    out_dir = (
+        Path(result_dir) / "2026" / subject
+        / "dynamic_network" / f"Ph{phase}_{speed}" / task_key
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    analyzer.plot_timeseries(result, save_path=out_dir / "timeseries_demo.png")
-    analyzer.plot_network(result, window_idx=result.n_windows // 2,
-                          save_path=out_dir / "network_demo.png")
-    analyzer.save_metrics_csv(result, out_dir, prefix="demo")
-    analyzer.export_for_gnn(result, out_dir / "demo_for_gnn.npz")
+    analyzer.plot_timeseries(
+        result,
+        save_path=out_dir / f"timeseries_{task_key}_Ph{phase}_{speed}.png",
+        task_key=task_key, phase=phase, speed=speed,
+    )
+    analyzer.plot_network(
+        result,
+        window_idx=result.n_windows // 2,
+        save_path=out_dir / f"network_{task_key}_Ph{phase}_{speed}.png",
+        title_extra=f"{task_key} Ph{phase} {speed}m/s",
+    )
+    analyzer.save_metrics_csv(result, out_dir,
+                              prefix=f"{task_key}_Ph{phase}_{speed}")
+    npz_path = out_dir / f"for_gnn_{task_key}_Ph{phase}_{speed}.npz"
+    analyzer.export_for_gnn(result, npz_path, emg_data=emg)
+    print(f"  -> {out_dir}")
 
-    print(f"\n=== デモ完了。結果: {out_dir.resolve()} ===")
+
+if __name__ == "__main__":
+    import argparse, time
+
+    p = argparse.ArgumentParser(
+        description="MI Dynamic Muscle Network — 実データ実行"
+    )
+    p.add_argument('--subjects',    nargs='+', default=['Ide'])
+    p.add_argument('--tasks',       nargs='+',
+                   default=['task01', 'task02', 'task03'])
+    p.add_argument('--phases',      nargs='+', type=int,
+                   default=[1, 2, 3, 4, 5])
+    p.add_argument('--base_dir',    default=r"C:\Users\ihika\2026_experiment")
+    p.add_argument('--result_dir',  default=r"C:\FuttoAnalysis\result")
+    p.add_argument('--window_ms',   type=float, default=200.0)
+    p.add_argument('--step_ms',     type=float, default=100.0)
+    p.add_argument('--n_neighbors', type=int,   default=5)
+    p.add_argument('--n_jobs',      type=int,   default=-1)
+    args = p.parse_args()
+
+    print("=" * 60)
+    print("  MI Dynamic Muscle Network Analyzer")
+    print("=" * 60)
+    print(f"  subjects : {args.subjects}")
+    print(f"  tasks    : {args.tasks}")
+    print(f"  phases   : {args.phases}")
+    print(f"  window   : {args.window_ms}ms  step: {args.step_ms}ms")
+    print(f"  n_jobs   : {args.n_jobs}")
+
+    analyzer = DynamicMuscleNetworkAnalyzer(
+        fs=2000, window_ms=args.window_ms, step_ms=args.step_ms,
+        n_neighbors=args.n_neighbors, n_jobs=args.n_jobs,
+        sparsify='percentile', sparsify_param=0.70,
+    )
+    print(f"  window_size={analyzer.window_size}pts  step={analyzer.step_size}pts")
+
+    total_t0 = time.time()
+    phase_speed = {1:'0.7', 2:'0.9', 3:'1.1', 4:'1.3', 5:'1.5'}
+    for subject in args.subjects:
+        for task_key in args.tasks:
+            for phase in args.phases:
+                speed = phase_speed.get(phase, str(phase))
+                print(f"\n{'='*55}")
+                print(f"  {subject} / {task_key} / Phase{phase} ({speed}m/s)")
+                print(f"{'='*55}")
+                try:
+                    _run_one(task_key, phase, subject,
+                             args.base_dir, args.result_dir, analyzer)
+                except Exception as e:
+                    print(f"  [Error] {e}")
+
+    elapsed = time.time() - total_t0
+    print(f"\n{'='*55}")
+    print(f"  全処理完了: {elapsed/60:.1f}分")
+    print(f"  出力先: {args.result_dir}\\2026\\{{subject}}\\dynamic_network\\")
+    print(f"{'='*55}")
