@@ -507,31 +507,56 @@ class DynamicMuscleNetworkAnalyzer:
 
     def _global_efficiency_nx(self, G) -> float:
         """
-        Global Efficiency を NetworkX で計算する。
-        距離 = 1 / weight として最短経路を求める。
+        Global Efficiency を NetworkX で計算する（正規化済み版）。
 
-        E = 1/(N(N-1)) * Σ_{i≠j} 1/d_ij
+        【定義】
+          距離: d_ij = 1 / MI_ij  （MI が大きいほど近い）
+          E = (1 / N(N-1)) * Σ_{i≠j} (1 / d_ij)
+            = (1 / N(N-1)) * Σ_{i≠j} MI_ij_shortest
+
+        【正規化】
+          完全グラフ（全エッジの MI が最大値 MI_max）の場合の E_max で割る:
+          E_norm = E / E_max  ∈ [0, 1]
+          E_max = MI_max（1ホップで全ノードに到達できる完全グラフの場合）
+
+        【1.0 超過の問題の原因と修正】
+          旧実装: 距離 d = 1/MI を Dijkstra で計算 → その逆数 1/d = MI を加算
+          → 短い経路（多ホップ）で合計 MI が 1 を超える場合があった
+          修正後: 最大 MI 重みで正規化することで必ず [0, 1] に収まる
         """
         import networkx as nx
         N = G.number_of_nodes()
         if N <= 1:
             return 0.0
 
-        # エッジ属性 'distance' = 1/MI を追加
+        # エッジ属性 'distance' = 1 / (MI + ε) を追加
         G_dist = G.copy()
+        all_weights = []
         for u, v, data in G_dist.edges(data=True):
-            G_dist[u][v]['distance'] = 1.0 / (data['weight'] + 1e-12)
+            w = data['weight']
+            G_dist[u][v]['distance'] = 1.0 / (w + 1e-12)
+            all_weights.append(w)
 
-        total_inv = 0.0
+        if not all_weights:
+            return 0.0
+
+        # 最大 MI 値（正規化の基準）
+        mi_max = max(all_weights)
+        if mi_max <= 0:
+            return 0.0
+
+        total_inv_dist = 0.0
         for node in G_dist.nodes():
             lengths = nx.single_source_dijkstra_path_length(
                 G_dist, node, weight='distance'
             )
             for other, d in lengths.items():
                 if other != node and d > 0:
-                    total_inv += 1.0 / d
+                    # 1/d = 最短経路上の「MI的な近さ」
+                    # mi_max で割って正規化 → 最大でも 1.0
+                    total_inv_dist += (1.0 / d) / mi_max
 
-        return float(total_inv / (N * (N - 1)))
+        return float(total_inv_dist / (N * (N - 1)))
 
     def _louvain_modularity(self, G) -> float:
         """
