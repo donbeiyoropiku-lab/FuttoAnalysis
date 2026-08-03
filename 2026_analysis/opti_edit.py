@@ -21,6 +21,7 @@
 # ============================================================================
 import os
 import sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
@@ -236,6 +237,33 @@ def resync_anatomical(obs_df, all_template_ids, anatomical_rules):
 
     ok = (len(pose_map) == len(all_template_ids))
     return pose_map, id_map, ok
+
+
+def assign_heel_toe_by_z(candidate_df, tid_toe, tid_heel):
+    """
+    残り2点(踵・つま先候補)を、進行方向(Z軸、大きい方が前=つま先)に基づいて
+    テンプレートIDへ割り当てる共通ロジック。
+
+    process_task03() (単脚5点) と process_joint_markers() (両脚10点) の
+    両方から呼び出される (元は process_task03() 内にインラインで実装されていた
+    ロジックを、挙動を変えずに関数として切り出したもの)。
+
+    Parameters
+    ----------
+    candidate_df : pd.DataFrame  'id', 'z' 列を持つ、ちょうど2行のDataFrame
+    tid_toe, tid_heel : int  割り当て先テンプレートID (Z大→toe, Z小→heel)
+
+    Returns
+    -------
+    dict {raw_id(int): template_id(int)}  2点に一致しない場合は空dict
+    """
+    if len(candidate_df) != 2:
+        return {}
+    foot_sorted_z = candidate_df.sort_values('z', ascending=False).reset_index(drop=True)
+    return {
+        int(foot_sorted_z.iloc[0]['id']): tid_toe,   # Z大 → つま先(進行方向前)
+        int(foot_sorted_z.iloc[1]['id']): tid_heel,  # Z小 → 踵(進行方向後ろ)
+    }
 
 
 # =============================================================================
@@ -664,11 +692,9 @@ def process_task03(cfg):
                 ankle_tid = y_order[2]   # 67632
                 new_map[int(rest3.iloc[0]['id'])] = ankle_tid  # rest3はすでにY降順
 
-                # Step3: 残り2点をZ降順 → Toe/Heel
+                # Step3: 残り2点をZ降順 → Toe/Heel (共通関数 assign_heel_toe_by_z を使用)
                 foot2 = rest3.iloc[1:].reset_index(drop=True)
-                foot_sorted_z = foot2.sort_values('z', ascending=False).reset_index(drop=True)
-                new_map[int(foot_sorted_z.iloc[0]['id'])] = tid_toe   # Z大 → Toe(進行方向前)
-                new_map[int(foot_sorted_z.iloc[1]['id'])] = tid_heel  # Z小 → Heel(進行方向後ろ)
+                new_map.update(assign_heel_toe_by_z(foot2, tid_toe, tid_heel))
 
             if ok:
                 # 新しいマッピングで id_map を更新（既存登録と矛盾があれば上書き）
@@ -730,6 +756,296 @@ def process_task03(cfg):
         os.makedirs(out_dir, exist_ok=True)
     df_out.to_csv(output_csv_path, index=False, float_format='%.6f')
     print(f"保存完了: {output_csv_path}")
+
+
+# =============================================================================
+# 関節マーカー方式 (左右10点) 専用処理
+# =============================================================================
+
+def split_left_right_by_x(obs_df):
+    """
+    観測点群をX座標(左右方向)に基づき2グループに分割する。
+
+    脚は左右に離れて配置されるため、X値でソートし、最大ギャップ(隙間)の
+    直後で2分割する(k-meansの代わりに、外れ値に強い単純な手法を採用)。
+
+    Returns
+    -------
+    (group_a, group_b) : (pd.DataFrame, pd.DataFrame) いずれかの順序不定
+                          (左右どちらがgroup_aかは呼び出し側でX平均から判定する)
+    """
+    if len(obs_df) < 2:
+        return None, None
+    sorted_df = obs_df.sort_values('x').reset_index(drop=True)
+    x_vals = sorted_df['x'].to_numpy()
+    gaps = np.diff(x_vals)
+    if len(gaps) == 0:
+        return None, None
+    split_idx = int(np.argmax(gaps)) + 1
+    group_a = sorted_df.iloc[:split_idx].reset_index(drop=True)
+    group_b = sorted_df.iloc[split_idx:].reset_index(drop=True)
+    return group_a, group_b
+
+
+def resync_bilateral_anatomical(obs_df, template_ids_map, left_is_negative_x=True):
+    """
+    左右10点(各5点: Hip/Knee/Ankle/Heel/Toe)の解剖学的座標ルールによる Resync。
+
+    判別手順 (各脚ごとに process_task03() の anatomical 判別と同じロジックを適用):
+      1. X座標で左右2グループに分割 (split_left_right_by_x、最大ギャップで2分割)。
+      2. 各グループ内でY降順上位3点 → Hip / Knee / Ankle に確定。
+      3. 残り2点をZ降順 → Toe(Z大)/Heel(Z小) に確定 (assign_heel_toe_by_z)。
+
+    Parameters
+    ----------
+    obs_df : pd.DataFrame  'id','x','y','z' 列を持つ、ちょうど10行のDataFrame
+    template_ids_map : dict  CONFIG.JOINT_MARKER_TEMPLATE_IDS
+        ({'L_Hip': 1, 'L_Knee': 2, ..., 'R_Toe': 10} 形式)
+    left_is_negative_x : bool
+        True の場合、X平均が小さい(負側)グループを左脚とみなす。
+        ★ OptiTrackワールド座標のX軸符号はキャリブレーション設定に依存するため、
+          実データ取得後に必ず検証すること (要検証事項)。
+
+    Returns
+    -------
+    (id_map, ok) : ({raw_id(int): template_id(int)}, bool)
+    """
+    if len(obs_df) != 10:
+        return {}, False
+
+    group_a, group_b = split_left_right_by_x(obs_df)
+    if group_a is None or len(group_a) != 5 or len(group_b) != 5:
+        return {}, False
+
+    mean_x_a = group_a['x'].mean()
+    mean_x_b = group_b['x'].mean()
+    a_is_left = (mean_x_a < mean_x_b) if left_is_negative_x else (mean_x_a > mean_x_b)
+    left_grp, right_grp = (group_a, group_b) if a_is_left else (group_b, group_a)
+
+    id_map = {}
+    for leg_prefix, leg_df in (('L', left_grp), ('R', right_grp)):
+        leg_sorted_y = leg_df.sort_values('y', ascending=False).reset_index(drop=True)
+        if len(leg_sorted_y) != 5:
+            return {}, False
+
+        # Y上位3点 → Hip, Knee, Ankle (近位→遠位の順)
+        for i, joint in enumerate(['Hip', 'Knee', 'Ankle']):
+            tid = template_ids_map[f'{leg_prefix}_{joint}']
+            id_map[int(leg_sorted_y.iloc[i]['id'])] = tid
+
+        # 残り2点 → Toe/Heel (Z降順、共通関数を使用)
+        foot2 = leg_sorted_y.iloc[3:].reset_index(drop=True)
+        tid_toe = template_ids_map[f'{leg_prefix}_Toe']
+        tid_heel = template_ids_map[f'{leg_prefix}_Heel']
+        id_map.update(assign_heel_toe_by_z(foot2, tid_toe, tid_heel))
+
+    ok = (len(id_map) == 10)
+    return id_map, ok
+
+
+def process_joint_markers(subject, day, task, device_worn,
+                           opti_csv_path=None, output_csv_path=None,
+                           occlusion_log_path=None,
+                           left_is_negative_x=True):
+    """
+    左右10点(股関節・膝関節・足関節・踵・つま先)の関節マーカーを処理する汎用関数。
+    task01, task02, task03 すべてに対応する。
+
+    process_task03() は凍結対象のため一切変更しない。この関数は process_task03()
+    とは独立した新規関数だが、進行方向判定ロジック (assign_heel_toe_by_z) は
+    共通関数として切り出し、両方から呼び出している。
+
+    体軸(体幹の向き)は地面に鉛直な軸に平行であると近似する。関節角度はこの
+    鉛直軸に対するセグメント角度として算出するため、体幹の実測傾斜(前傾・後傾等)
+    は反映されない前提である (骨盤・体幹マーカーを配置しないため実測不可)。
+
+    device_worn=True の場合(task01/task02):
+        Futtoのゴムによるマーカー遮蔽(オクルージョン)が発生しうるため、
+        連続 CONFIG.OCCLUSION_MIN_GAP_FRAMES フレーム以上の欠損区間を検出し、
+        ログ (occlusion_log_path) に出力する。
+
+    原則 (process_task03() と同じ):
+        - 観測データは常に補間より優先する。
+        - 一度マッピングされた生マーカーID → テンプレートIDの対応は、
+          以後のフレームでも固定する。
+        - 遮蔽と判定された区間は補間せず、欠損として出力から除外する。
+
+    Parameters
+    ----------
+    subject, day, task : str  被験者・計測日('First'/'Second'/'Third')・タスク
+    device_worn : bool  Futto着用の有無 (task01/task02=True, task03=False)
+    opti_csv_path, output_csv_path : str または Path または None
+        None の場合、CONFIG.get_raw_path('opti', subject, day, task) から自動生成する。
+    occlusion_log_path : str または Path または None
+        None の場合、output_csv_path と同じディレクトリに
+        '{task}_occlusion_log.csv' として保存する。
+    left_is_negative_x : bool  左右脚判別のX軸符号仮定 (要実データ検証、上記参照)。
+
+    Returns
+    -------
+    pd.DataFrame または None
+    """
+    print(f"\n--- process_joint_markers: {subject}/{day}/{task} "
+          f"(device_worn={device_worn}) ---")
+
+    if opti_csv_path is None:
+        opti_csv_path = CONFIG.get_raw_path('opti', subject, day, task)
+    opti_csv_path = Path(opti_csv_path) if not isinstance(opti_csv_path, Path) else opti_csv_path
+
+    if output_csv_path is None:
+        output_csv_path = opti_csv_path.parent / f"{opti_csv_path.stem}_corrected_joints.csv"
+    output_csv_path = Path(output_csv_path) if not isinstance(output_csv_path, Path) else output_csv_path
+
+    if occlusion_log_path is None:
+        occlusion_log_path = output_csv_path.parent / f"{task}_occlusion_log.csv"
+    occlusion_log_path = Path(occlusion_log_path) if not isinstance(occlusion_log_path, Path) else occlusion_log_path
+
+    template_ids_map = CONFIG.JOINT_MARKER_TEMPLATE_IDS
+    template_ids = list(template_ids_map.values())
+    n_expected = len(template_ids)  # 10
+    min_gap = CONFIG.OCCLUSION_MIN_GAP_FRAMES
+
+    plausible_bounds = {'x': (-1500, 1500), 'y': (0, 2000), 'z': (-3000, 3000)}
+
+    df_long = load_opti_data_to_long_robust(str(opti_csv_path))
+    if df_long is None or df_long.empty:
+        print("エラー: データ読み込み失敗。"); return None
+
+    df_long = df_long[
+        df_long['x'].between(*plausible_bounds['x']) &
+        df_long['y'].between(*plausible_bounds['y']) &
+        df_long['z'].between(*plausible_bounds['z'])
+    ].copy()
+    print(f"  空間範囲フィルタ後: {len(df_long)} 行")
+
+    id_map = {}           # raw_id -> template_id (一度登録したら永続)
+    registered_tids = set()  # 一度でも登録されたtemplate_id (遮蔽検出の起点)
+    output_rows = []
+
+    # オクルージョン検出用: template_idごとの現在の連続欠損長・開始位置
+    missing_run = {tid: {'len': 0, 'start_time': None, 'start_frame': None}
+                   for tid in template_ids}
+    occlusion_events = []
+
+    unique_frames = sorted(df_long['Frame'].unique())
+    print(f"  処理フレーム数: {len(unique_frames)}")
+
+    for frame_idx, frame in enumerate(unique_frames):
+        if frame_idx % 1000 == 0:
+            print(f"  frame {frame_idx}/{len(unique_frames)} ...")
+
+        frame_df = df_long[df_long['Frame'] == frame]
+        time_val = frame_df['Time'].iloc[0]
+        obs = frame_df[['id', 'x', 'y', 'z']].copy()
+        obs['id'] = obs['id'].astype(int)
+        n_obs = len(obs)
+
+        frame_tid_positions = {}  # template_id -> (x, y, z) このフレームで確定した座標
+
+        if n_obs == n_expected:
+            # ★ 10点揃い: 解剖学的判別でTIDを確定
+            new_map, ok = resync_bilateral_anatomical(obs, template_ids_map, left_is_negative_x)
+            if ok:
+                for raw_id, tid in new_map.items():
+                    if raw_id in id_map and id_map[raw_id] != tid:
+                        print(f"  [ID更新] raw={raw_id}: {id_map[raw_id]} -> {tid}  @t={time_val:.3f}s")
+                    id_map[raw_id] = tid
+                registered_tids.update(new_map.values())
+                for _, row in obs.iterrows():
+                    raw_id = int(row['id'])
+                    tid = new_map[raw_id]
+                    frame_tid_positions[tid] = (row['x'], row['y'], row['z'])
+            else:
+                # 判別失敗 → id_map登録済みのraw_idだけ採用
+                for _, row in obs.iterrows():
+                    raw_id = int(row['id'])
+                    if raw_id in id_map:
+                        frame_tid_positions[id_map[raw_id]] = (row['x'], row['y'], row['z'])
+        elif n_obs > 0:
+            # ★ 10点未満: id_map登録済みのraw_idだけTID変換して採用 (補完しない)
+            for _, row in obs.iterrows():
+                raw_id = int(row['id'])
+                if raw_id in id_map:
+                    frame_tid_positions[id_map[raw_id]] = (row['x'], row['y'], row['z'])
+        # n_obs == 0 → 何も採用しない
+
+        # --- 出力行の確定 & オクルージョン(欠損)検出 ---
+        for tid in template_ids:
+            if tid in frame_tid_positions:
+                x, y, z = frame_tid_positions[tid]
+                output_rows.append((frame, time_val, tid, x, y, z))
+
+                run = missing_run[tid]
+                if run['len'] >= min_gap:
+                    occlusion_events.append({
+                        'template_id': tid,
+                        'start_frame': run['start_frame'], 'end_frame': frame,
+                        'start_time': run['start_time'], 'end_time': time_val,
+                        'n_frames': run['len'],
+                    })
+                run['len'] = 0
+                run['start_time'] = None
+                run['start_frame'] = None
+            else:
+                # 一度も識別されていないTIDは「立ち上げ待ち」であり遮蔽とはみなさない
+                if tid in registered_tids:
+                    run = missing_run[tid]
+                    if run['len'] == 0:
+                        run['start_time'] = time_val
+                        run['start_frame'] = frame
+                    run['len'] += 1
+                # 欠損として出力しない(補間しない)
+
+    # ループ終了時点でまだ続いている欠損runも記録する
+    last_frame = unique_frames[-1] if unique_frames else None
+    for tid, run in missing_run.items():
+        if run['len'] >= min_gap:
+            occlusion_events.append({
+                'template_id': tid,
+                'start_frame': run['start_frame'], 'end_frame': last_frame,
+                'start_time': run['start_time'], 'end_time': None,
+                'n_frames': run['len'],
+            })
+
+    label_by_tid = {v: k for k, v in template_ids_map.items()}
+    if occlusion_events:
+        print(f"\n  [遮蔽検出] {len(occlusion_events)} 件 "
+              f"(device_worn={device_worn}, しきい値={min_gap}フレーム)")
+        for ev in occlusion_events:
+            label = label_by_tid.get(ev['template_id'], ev['template_id'])
+            print(f"    {label}: frame {ev['start_frame']}〜{ev['end_frame']}"
+                  f"  ({ev['n_frames']}フレーム, t={ev['start_time']:.3f}s〜)")
+        df_occlusion = pd.DataFrame(occlusion_events)
+        df_occlusion['marker_label'] = df_occlusion['template_id'].map(label_by_tid)
+        occlusion_log_path.parent.mkdir(parents=True, exist_ok=True)
+        df_occlusion.to_csv(occlusion_log_path, index=False)
+        print(f"  -> 遮蔽ログを保存しました: {occlusion_log_path}")
+    else:
+        print("  [遮蔽検出] 該当区間なし。")
+
+    if not output_rows:
+        print("エラー: 出力データが0行になりました。")
+        return None
+
+    df_out = pd.DataFrame(output_rows, columns=['Frame', 'Time', 'id', 'x', 'y', 'z'])
+    df_out = df_out.drop_duplicates(subset=['Frame', 'id'], keep='first')
+    df_out = df_out.sort_values(['Frame', 'id']).reset_index(drop=True)
+
+    # 座標系統一: 生OptiTrack (X=左右, Y=鉛直上, Z=進行前) → 統一系 (X=前, Y=横, Z=上)
+    x_raw, y_raw, z_raw = df_out['x'].copy(), df_out['y'].copy(), df_out['z'].copy()
+    df_out['x'] = z_raw
+    df_out['y'] = x_raw
+    df_out['z'] = y_raw
+    print("  [座標変換] X=横,Y=上,Z=前 → X=前,Y=横,Z=上 を適用しました。")
+
+    print(f"\n処理完了。出力行数: {len(df_out)}")
+    print(f"  id_map 最終登録数: {len(id_map)} 件")
+
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_csv(output_csv_path, index=False, float_format='%.6f')
+    print(f"保存完了: {output_csv_path}")
+
+    return df_out
 
 
 # =============================================================================

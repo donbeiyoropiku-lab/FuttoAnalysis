@@ -259,22 +259,28 @@ def build_emg_raw_path(
     task_key  : str,
     subject   : str = "Ide",
     base_dir  : str = r"C:\Users\ihika\2026_experiment",
+    day       : Optional[str] = None,
 ) -> Path:
     """
     Cometa .txt ファイルのパスを生成する。
 
-    例:
+    例 (day=None, 既存の単日データ):
       C:\\Users\\ihika\\2026_experiment\\Ide\\EMG\\task01\\task01.txt
+
+    例 (day を指定, 多被験者×3日反復測定):
+      C:\\Users\\ihika\\2026_experiment\\Ide\\EMG\\First\\task01.txt
 
     Parameters
     ----------
     task_key : 'task01', 'task02', 'task03'
     subject  : 被験者名
     base_dir : 実験データのルートディレクトリ
+    day      : 'First' / 'Second' / 'Third' など。None の場合は既存の
+               単日パス規則 (subject/EMG/{task}/{task}.txt) を維持する。
     """
-    return (
-        Path(base_dir) / subject / "EMG" / task_key / f"{task_key}.txt"
-    )
+    if day is None:
+        return Path(base_dir) / subject / "EMG" / task_key / f"{task_key}.txt"
+    return Path(base_dir) / subject / "EMG" / day / f"{task_key}.txt"
 
 
 # =============================================================================
