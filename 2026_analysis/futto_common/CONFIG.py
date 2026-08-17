@@ -35,8 +35,8 @@ DAYS = ["First", "Second", "Third"]
 
 # 多被験者拡張の被験者ID。実際の被験者が確定していないため仮のプレースホルダー。
 # 被験者が確定したらこのリストを更新すること。
-SUBJECTS_MULTI = ["Ide", "SUBJECT_B", "SUBJECT_C", "SUBJECT_D",
-                  "SUBJECT_E", "SUBJECT_F", "SUBJECT_G"]
+SUBJECTS_MULTI = ["Okumura", "Sakai", "Kojima", "Hara",
+                  "Yanagawa", "Sawada", "Kanai"]
 
 # opti / labchart / cpet の生データ拡張子。EMG(Cometa)は別ルート・別関数
 # (futto_network_real/emg_pipeline/emg_loader.py の build_emg_raw_path) を使う。
@@ -66,6 +66,30 @@ def get_raw_path(device: str, subject: str, day: str, task: str) -> Path:
     return RAW_ROOT / device / subject / day / f"{task}.{ext}"
 
 
+# --- 関節マーカー方式・新実験データルート ---
+#
+# 前実験では task03 (器具非着用) のみ関節に直接マーカーを貼付していたが、
+# 今回の実験では task01〜03 すべてで関節マーカー方式(左右10点)を用いる。
+# 生データは既存の opti/{subject}/{day}/{task}.csv (get_raw_path) とは
+# 別の "opti\joint" 配下に保存される。
+JOINT_RAW_ROOT = RAW_ROOT / "opti" / "joint"
+
+
+def get_joint_opti_path(subject: str, day: str, task: str) -> Path:
+    """
+    関節マーカー方式(新実験)の Opti 生データパスを返す。
+
+    例: get_joint_opti_path('Ide', 'First', 'task01')
+        -> C:\\FuttoAnalysis\\opti\\joint\\Ide\\First\\task01.csv
+
+    get_raw_path('opti', ...) (C:\\FuttoAnalysis\\opti\\{subject}\\{day}\\{task}.csv)
+    とはディレクトリ構造が異なる、新実験専用のパス生成。
+    """
+    if day not in DAYS:
+        raise ValueError(f"day は {DAYS} のいずれか。指定値: {day}")
+    return JOINT_RAW_ROOT / subject / day / f"{task}.csv"
+
+
 # --- 関節マーカー方式 (左右の脚関節のみ、計10点) ---
 #
 # OptiTrackの生マーカーIDは被験者・計測ごとに異なる(セッションごとの
@@ -80,6 +104,19 @@ JOINT_MARKER_TEMPLATE_IDS = {
     'L_Hip': 1, 'L_Knee': 2, 'L_Ankle': 3, 'L_Heel': 4, 'L_Toe': 5,
     'R_Hip': 6, 'R_Knee': 7, 'R_Ankle': 8, 'R_Heel': 9, 'R_Toe': 10,
 }
+
+# 関節マーカー方式(新実験)の仮想関節定義。マーカーが関節上に直接あるため、
+# 旧task03と同様 'single' でテンプレートIDをそのまま参照する
+# (joint_analysis/joint_calc.py の calc_joint_centers() が参照する)。
+JOINT_CENTER_DEFS_MULTI = {
+    name: {'type': 'single', 'markers': [tid]}
+    for name, tid in JOINT_MARKER_TEMPLATE_IDS.items()
+}
+
+# 関節マーカー方式(新実験)の基準マーカー。歩行周期平均化(create_anime_grad.py の
+# calculate_mean_gait_cycle)で全身の並進基準として使う単一マーカーが必要なため、
+# 左股関節マーカーを基準とする。
+JOINT_REFERENCE_MARKER_ID = JOINT_MARKER_TEMPLATE_IDS['L_Hip']
 
 # オクルージョン(マーカー遮蔽)判定しきい値。
 # 連続してこの値以上フレームが欠損した区間を「遮蔽」としてログに記録し、
