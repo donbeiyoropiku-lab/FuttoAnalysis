@@ -11,11 +11,11 @@ import os
 # --- ▼▼▼ 設定項目 ▼▼▼ ---
 
 # ★ 1. 読み込むCSVファイルのパスを指定
-YOUR_CSV_FILE_PATH = r"C:\FuttoAnalysis\opti\20260217\task03.csv"
+YOUR_CSV_FILE_PATH = r"C:\FuttoAnalysis\opti\20260820\mascle_map.csv"
 
 # ★ 2. アニメーション化したい時間の範囲（秒）を指定
-START_TIME_SECONDS = 100# (例: 15秒から)
-END_TIME_SECONDS = 110 # (例: 20秒まで)
+START_TIME_SECONDS = 30# (例: 15秒から)
+END_TIME_SECONDS = 40 # (例: 20秒まで)
 
 # ★ 3. 再生速度（1が等倍速。5 を指定すると 5倍速）
 PLAYBACK_SPEED_FACTOR = 1

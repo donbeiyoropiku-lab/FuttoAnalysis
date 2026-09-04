@@ -53,12 +53,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# --- CONFIG.py のパス解決 ---
+# --- CONFIG_MULTI.py (新実験用設定) のパス解決 ---
+# 前回実験専用の futto_common/CONFIG.py とは独立した、新実験専用の設定ファイル。
 _COMMON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'futto_common')
 if _COMMON_DIR not in sys.path:
     sys.path.insert(0, _COMMON_DIR)
 
-import CONFIG  # 設定モジュールのインポート
+import CONFIG_MULTI as CONFIG  # 新実験用設定モジュールのインポート
 
 
 # =============================================================================

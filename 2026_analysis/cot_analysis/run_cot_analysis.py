@@ -28,7 +28,7 @@ sys.path.insert(0, str(_HERE.parents[1]))
 sys.path.insert(0, str(_HERE.parents[1] / "futto_common"))
 
 import pandas as pd
-import CONFIG
+import CONFIG_MULTI as CONFIG  # 新実験用設定モジュール(前回実験専用のCONFIG.pyとは独立)
 
 from cot_analysis.cot_loader import load_cpet_txt
 from cot_analysis.cot_calc import (
