@@ -19,6 +19,10 @@
 #   6: 3D 力場アニメーション
 #   f: 力場3Dマップ (等値面 + ベクトル場)
 #   c: タスク間トルク比較 (別タスクを追加ロード)
+#   x: タスク間比較図 (全タスクを読み込み、軸の範囲をそろえて出力)
+#        1: 関節トルク解析 + スティック図 / 2: ゴム仕事量・エネルギー解析 /
+#        5: 関節角度時系列 を選択 (カンマ区切りで複数可、all で全て)。
+#        出力先: result/2026/{被験者}/comparison/Phase{N}_{speed}ms/
 #   q: 終了
 #
 # タスク・フェーズ選択時:
@@ -34,7 +38,17 @@ if __name__ == '__main__' and __package__ is None:
     __package__ = 'mechanics_analysis'
 
 from futto_common import CONFIG as config
-from .io_loader    import build_analysis_paths, load_opti_and_tension, save_csv
+from .io_loader    import (
+    build_analysis_paths,
+    build_comparison_dir,
+    load_opti_and_tension,
+    save_csv,
+)
+from .comparison   import (
+    plot_torque_stick_comparison,
+    plot_work_comparison,
+    plot_joint_angles_comparison,
+)
 from .physics_core import (
     unify_coordinate_system,
     calc_all_torques,
@@ -61,6 +75,16 @@ WORK_LOOP_TARGETS = [
     'Front_Knee_Upper_In', 'Back_Thigh_In',
     'Front_Shin', 'Back_Shin_In',
 ]
+
+# 解析対象の被験者。結果は result/2026/{SUBJECT}/{task}/{speed}/ 配下にある。
+SUBJECT = getattr(config, 'SUBJECTS', ['Ide'])[0]
+
+# タスク間比較で選べる解析 (キーは解析メニューの番号と同じ)
+COMPARISON_MENU = {
+    '1': '関節トルク解析 + スティック図',
+    '2': 'ゴム仕事量 / エネルギー解析',
+    '5': '関節角度時系列',
+}
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +132,12 @@ def _load_data(task_key, cfg, phase, speed):
         phase      = phase,
         speed      = speed,
         result_dir = getattr(config, 'RESULT_DIR', r"C:\FuttoAnalysis\result"),
+        subject    = SUBJECT,
     )
+    # ゴムのないタスク (LINES_TO_DRAW が空の task03 等) は張力データが存在しないので読まない
     df_mean, df_tension = load_opti_and_tension(
-        paths['opti_csv'], paths['tension_csv']
+        paths['opti_csv'], paths['tension_csv'],
+        load_tension=bool(cfg.get('LINES_TO_DRAW')),
     )
     if df_mean is None:
         return None, None, None, paths
@@ -119,6 +146,93 @@ def _load_data(task_key, cfg, phase, speed):
 
     df_unified = unify_coordinate_system(df_mean, task_key)
     return df_unified, df_tension, paths, paths
+
+
+# ---------------------------------------------------------------------------
+# タスク間比較 (軸の範囲をそろえた比較図)
+# ---------------------------------------------------------------------------
+
+def _phase_speed(phase: int) -> str:
+    """フェーズ番号 → 速度文字列 ('1.1' など)。"""
+    return config.PHASES[phase]['name'].replace('m/s', '')
+
+
+def _select_comparison_analyses() -> list:
+    """比較する解析 (1/2/5) を対話選択し、選ばれたキーのリストを返す。"""
+    print("\n--- タスク間比較 (軸の範囲をそろえた比較図) ---")
+    for k, v in COMPARISON_MENU.items():
+        print(f"  {k}: {v}")
+    print("  all: 上記すべて")
+    while True:
+        raw = input("作成する比較を選択 (例: 1,2,5 / all): ").strip().lower()
+        if raw == 'all':
+            return list(COMPARISON_MENU)
+        picks = [s for s in raw.replace(' ', ',').split(',') if s]
+        if picks and all(p in COMPARISON_MENU for p in picks):
+            return [k for k in COMPARISON_MENU if k in picks]   # 重複除去 + 番号順
+        print("  -> 1, 2, 5 のいずれか (カンマ区切りで複数可) か all を入力してください。")
+
+
+def run_task_comparison(phase: int, analyses: list) -> None:
+    """
+    1フェーズ分のタスク間比較図を作成する。全タスクのデータを読み込み、
+    result/2026/{SUBJECT}/comparison/Phase{N}_{speed}ms/ に保存する。
+
+    Parameters
+    ----------
+    phase    : フェーズ番号 (1-5)
+    analyses : 作成する比較のキー ('1', '2', '5' の部分集合)
+    """
+    speed    = _phase_speed(phase)
+    save_dir = build_comparison_dir(
+        getattr(config, 'RESULT_DIR', r"C:\FuttoAnalysis\result"), SUBJECT, phase, speed
+    )
+
+    print("\n" + "=" * 60)
+    print(f" タスク間比較: Phase{phase} ({speed}m/s)  比較={','.join(analyses)}")
+    print(f" 保存先: {save_dir}")
+    print("=" * 60)
+
+    # --- 全タスクのデータをロード (ロードできたタスクだけを比較対象にする) ---
+    task_data = {}
+    for tk in [t for t in config.TASKS if t in config.TASK_CONFIGS]:
+        cfg = config.TASK_CONFIGS[tk]
+        df_unified, df_tension, _, _ = _load_data(tk, cfg, phase, speed)
+        if df_unified is None:
+            print(f"  -> {tk}: データが見つからないため比較から除外します。")
+            continue
+        task_data[tk] = {'cfg': cfg, 'df_unified': df_unified, 'df_tension': df_tension}
+
+    if len(task_data) < 2:
+        print("  -> 比較に必要な2タスク以上のデータが揃いませんでした。")
+        return
+
+    task_titles = getattr(config, 'TASK_TITLES', {})
+    seg_groups  = getattr(config, 'SEGMENT_GROUPS', {})
+
+    # 1つの比較が失敗しても残りを続ける
+    if '1' in analyses:
+        print("\n[比較1] 関節トルク解析 + スティック図...")
+        try:
+            plot_torque_stick_comparison(task_data, phase, speed, save_dir, task_titles)
+        except Exception as e:
+            print(f"  -> エラー: {e}")
+
+    if '2' in analyses:
+        print("\n[比較2] ゴム仕事量 / エネルギー解析...")
+        try:
+            plot_work_comparison(task_data, phase, speed, save_dir, seg_groups, task_titles)
+        except Exception as e:
+            print(f"  -> エラー: {e}")
+
+    if '5' in analyses:
+        print("\n[比較5] 関節角度時系列...")
+        try:
+            plot_joint_angles_comparison(task_data, phase, speed, save_dir, task_titles)
+        except Exception as e:
+            print(f"  -> エラー: {e}")
+
+    print(f"\n タスク間比較完了。出力先: {save_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +457,7 @@ def main():
             '7': '関節パワー解析 (P = tau_y x omega_y)',
             'f': '力場3Dマップ (等値面 + ベクトル場)',
             'c': 'タスク間トルク比較 (別タスクを追加ロード)',
+            'x': 'タスク間比較図 (全タスクを軸をそろえて比較: 1/2/5を選択)',
             'q': '終了',
         }
         for k, v in menu.items():
@@ -479,6 +594,16 @@ def main():
                                      save_dir=save_dir)
             else:
                 print("比較に必要なデータが揃いませんでした。")
+
+        # ---- x: タスク間比較図 (軸をそろえた比較: 1/2/5) ----
+        elif mode == 'x':
+            analyses = _select_comparison_analyses()
+            scope = input(
+                f"対象フェーズ [Enter: Phase{phase} ({speed}m/s) / all: 全フェーズ]: "
+            ).strip().lower()
+            target_phases = list(config.PHASES) if scope == 'all' else [phase]
+            for ph in target_phases:
+                run_task_comparison(ph, analyses)
 
         elif mode == 'q':
             print("終了します。")

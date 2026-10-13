@@ -111,7 +111,7 @@ def plot_joint_torques(torque_df: pd.DataFrame, cfg: dict,
 
 
 def _plot_stick_figure(ax: plt.Axes, df_mean_cycle_unified: pd.DataFrame,
-                       cfg: dict) -> None:
+                       cfg: dict, frame_spacing: float | None = None) -> None:
     """
     XZ平面 (矢状面) スティック図を10%刻みで描画する。
 
@@ -119,6 +119,11 @@ def _plot_stick_figure(ax: plt.Axes, df_mean_cycle_unified: pd.DataFrame,
         - X 反転を廃止 (X=進行正なのでそのまま左→右に歩行が表示される)
         - base_pos の値を np.array に統一 (calc_joint_center への正しい入力形式)
         - 各フレームを等間隔に横並びで表示するオフセット処理を整理
+
+    frame_spacing:
+        フレーム間の横間隔 [mm]。None の場合はデータのX範囲 x 1.3 を自動算出する
+        (従来動作)。タスク間比較図で複数タスクのスケールをそろえるときに
+        共通値を指定する。
     """
     joint_defs      = cfg.get('JOINT_CENTER_DEFS', {})
     foot_marker_ids = cfg.get('SEGMENTS', {}).get('Foot', [])
@@ -145,9 +150,10 @@ def _plot_stick_figure(ax: plt.Axes, df_mean_cycle_unified: pd.DataFrame,
     except KeyError:
         pass
 
-    # 表示幅: 全マーカーのX範囲から算出
-    x_range = df_mean_cycle_unified['x'].max() - df_mean_cycle_unified['x'].min()
-    frame_spacing = x_range * 1.3   # フレーム間の横間隔
+    # 表示幅: 全マーカーのX範囲から算出 (frame_spacing 未指定時のみ)
+    if frame_spacing is None:
+        x_range = df_mean_cycle_unified['x'].max() - df_mean_cycle_unified['x'].min()
+        frame_spacing = x_range * 1.3   # フレーム間の横間隔
 
     all_x, all_z = [], []
 

@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 def build_analysis_paths(cfg: dict, task_key: str, phase: int, speed: str,
-                         result_dir: str) -> dict:
+                         result_dir: str, subject: str | None = None) -> dict:
     """
     タスク・フェーズ・速度から解析用の全パスを一括生成する。
 
@@ -30,6 +30,9 @@ def build_analysis_paths(cfg: dict, task_key: str, phase: int, speed: str,
     phase      : 1-5
     speed      : '0.7', '0.9', ...  (m/s の数値部分)
     result_dir : CONFIG.RESULT_DIR
+    subject    : 被験者名 (例: 'Ide')。指定すると張力CSV・出力先が
+                 result/2026/{subject}/{task}/{speed}/ 配下になる。
+                 None の場合は従来通り result/2026/{task}/{speed}/ (後方互換)。
 
     Returns
     -------
@@ -46,7 +49,10 @@ def build_analysis_paths(cfg: dict, task_key: str, phase: int, speed: str,
     opti_csv    = f"{base_mean}_Phase{phase}_{speed}ms.csv"
 
     # 張力データは strength_visualize が出力した result_dir 配下のファイルを参照する
-    out_base    = Path(result_dir) / "2026" / task_key / speed
+    year_dir    = Path(result_dir) / "2026"
+    if subject:
+        year_dir = year_dir / subject
+    out_base    = year_dir / task_key / speed
     tension_csv = str(out_base / f"{task_key}_Phase{phase}_{speed}ms_tension.csv")
 
     return {
@@ -58,17 +64,32 @@ def build_analysis_paths(cfg: dict, task_key: str, phase: int, speed: str,
     }
 
 
+def build_comparison_dir(result_dir: str, subject: str,
+                         phase: int, speed: str) -> str:
+    """
+    タスク間比較図の保存先ディレクトリを返す (フェーズごとにサブフォルダを分ける)。
+
+    例: result/2026/Ide/comparison/Phase3_1.1ms
+    """
+    return str(Path(result_dir) / "2026" / subject / "comparison"
+               / f"Phase{phase}_{speed}ms")
+
+
 def load_opti_and_tension(opti_csv_path: str,
-                          tension_csv_path: str) -> tuple:
+                          tension_csv_path: str,
+                          load_tension: bool = True) -> tuple:
     """
     OptiTrack 平均化 CSV と張力 CSV を読み込む。
 
+    load_tension=False の場合は張力 CSV を読みに行かず df_tension=None を返す
+    (ゴムを持たない task03 のように、張力データが元々存在しないタスク用)。
+
     Returns
     -------
-    (df_mean_cycle, df_tension) または (None, None)
+    (df_mean_cycle, df_tension)  読み込めなかったものは None
     """
     df_mean = _safe_read_csv(opti_csv_path,    "OptiTrack平均化データ")
-    df_ten  = _safe_read_csv(tension_csv_path, "張力データ")
+    df_ten  = _safe_read_csv(tension_csv_path, "張力データ") if load_tension else None
     return df_mean, df_ten
 
 
